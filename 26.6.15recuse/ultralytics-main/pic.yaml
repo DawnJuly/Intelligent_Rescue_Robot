@@ -1,0 +1,8 @@
+path: C:/Users/23311/Desktop/26.6.15recuse/ultralytics-main/datasets/dataset/pic
+train: images/train
+val: images/val
+test: images/test
+
+nc: 6
+
+names: ["Red", "Blue", "Yellow", "Black","RedSafe","BlueSafe"]

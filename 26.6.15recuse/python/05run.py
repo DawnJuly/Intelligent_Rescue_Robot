@@ -1,0 +1,329 @@
+from libs.PipeLine import PipeLine
+from libs.YOLO import YOLOv8
+from libs.Utils import *
+import os, sys, gc
+import _thread
+import ulab.numpy as np
+import image
+import math
+from machine import UART
+from machine import FPIOA
+import time
+
+dic = {
+    -1:"Wrong",
+    0: "Red",
+    1: "Blue",
+    2: "Yellow",
+    3: "Black",
+    4: "RedSafe",
+    5: "BlueSafe",
+}
+
+TX_PIN = 3
+RX_PIN = 4
+UART_ID = UART.UART1
+UART_BAUDRATE = 115200
+
+# 初始化引脚与串口
+def init_hardware():
+    # 配置引脚
+    fpioa = FPIOA()
+    fpioa.set_function(TX_PIN, FPIOA.UART1_TXD)
+    fpioa.set_function(RX_PIN, FPIOA.UART1_RXD)
+
+    # 初始化UART1，波特率115200，8位数据位，无校验，1位停止位
+    uart = UART(
+        UART_ID,
+        baudrate=UART_BAUDRATE,
+        bits=UART.EIGHTBITS,
+        parity=UART.PARITY_NONE,
+        stop=UART.STOPBITS_ONE
+    )
+    return uart
+
+# 这里仅为示例，自定义场景请修改为您自己的模型路径、标签名称、模型输入大小
+kmodel_path = "/sdcard/yolo11s_det_640.kmodel"
+labels = ["Red", "Blue", "Yellow", "Black", "RedSafe", "BlueSafe"]
+model_input_size = [640, 640]
+confidence_threshold = 0.7  # 置信度阈值 模型输出的检测框置信度低于该值，会被直接过滤掉
+nms_threshold = 0.7  # 非极大值抑制阈值 用于去除重叠的重复检测框：两个框重叠度（IOU）高于该值时，只保留置信度更高的那个
+
+# 初始化yolo
+def init_yolo():
+    # 初始化YOLOv8实例
+    yolo = YOLOv8(
+        task_type="detect",
+        mode="video",
+        kmodel_path=kmodel_path,
+        labels=labels,
+        rgb888p_size=rgb888p_size,
+        model_input_size=model_input_size,
+        display_size=display_size,
+        conf_thresh=confidence_threshold,
+        nms_thresh=nms_threshold,
+        max_boxes_num=20,
+        debug_mode=0
+    )
+    return yolo
+
+# 串口通信发送信息
+def send(uart, yaw, distance, id):
+    try:
+        yaw = round(yaw)
+        distance = round(distance)
+        uart.write(f"[{yaw},{distance}]")
+        print(f"{dic[id]}小球发送成功，角度{yaw}，距离{distance}")
+        return True
+    except:
+        print("发送串口失败")
+        return False
+
+# 串口通信接收信息(阻塞式接收函数)
+def receive(uart):
+    while True:
+        data = uart.read()
+        # 找球模式，再重新循环一遍
+        if data == b"[A]":
+            print("收到[A]")
+            return 0
+        # 检查小球颜色
+        elif data == b"[CB]":
+            print("收到[CB]")
+            return 1
+        # 检查安全区颜色
+        elif data == b"[FS]":
+            print("收到[FS]")
+            return 2
+        # 进入第二轮
+        elif data == b"[FB]":
+            print("收到[FB]")
+            return 3
+
+K = 2600
+
+# 测量水平偏转角、距离
+def cal(x1, y1, w, h, image_w=800, image_h=480, h_fov=65, v_fov=40):
+    cx = int(x1 + w / 2)  # 目标中心横坐标
+    cy = int(y1 + h / 2)  # 目标中心纵坐标
+
+    # 水平偏角计算
+    degree_h = h_fov / image_w  # 每1度水平视场对应多少像素
+    offset_x = cx - image_w / 2  # 目标相对画面中心的水平像素偏移
+    yaw = offset_x * degree_h  # 像素偏移换算成实际水平偏角（度）
+
+    # 距离计算
+    length = K / ((w + h) / 2)
+
+    return (yaw, length)
+
+# 寻找最大的一个
+def find_max(ls):
+    max_index = -1
+    max_area = 0
+    for i, (x1, y1, w, h, _) in enumerate(ls):
+        area = w * h
+        if area > max_area:
+            max_index = i
+            max_area = area
+    if max_index != -1:
+        return ls[max_index]
+    return None
+
+purple_threshold = (10, 50, 0, 80, -40, 0)
+def check_purple(img, safe_ls):
+    safe_x, safe_y, safe_w, safe_h, _ = safe_ls
+
+    # 优先使用 ROI 限定搜索范围
+    try:
+        purple_blobs = img.find_blobs(
+            [purple_threshold],
+            roi=(int(safe_x), int(safe_y), int(safe_w), int(safe_h)),
+            area_threshold=1000,
+            pixels_threshold=1000,
+            merge=True
+        )
+        print("支持POI")
+    except Exception:
+        # 不支持 ROI 参数时，全图搜索后手动筛选
+        purple_blobs = img.find_blobs(
+            [purple_threshold],
+            area_threshold=1000,
+            pixels_threshold=1000,
+            merge=True
+        )
+
+        purple_blobs = [
+            b for b in purple_blobs
+            if safe_x <= b[5] <= safe_x + safe_w
+            and safe_y <= b[6] <= safe_y + safe_h
+        ]
+    if purple_blobs:
+        return (len(purple_blobs) > 0, purple_blobs)
+    else:
+        return (False, [])
+
+def filter_no_purple(img, boxes, ids, scores, our):
+    safe_id = 4 if our == 0 else 5  # 4=RedSafe, 5=BlueSafe
+
+    new_boxes = []
+    new_ids = []
+    new_scores = []
+    valid_safes = [] # 通过紫色检测的安全区
+
+    for box, id_, score in zip(boxes, ids, scores):
+        if id_ == safe_id:
+            x1, y1, w, h = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+            safe_box = [x1, y1, w, h, id_]
+            has_purple, _ = check_purple(img, safe_box)
+
+            if has_purple:
+                new_boxes.append(box)
+                new_ids.append(id_)
+                new_scores.append(score)
+                valid_safes.append(safe_box)
+            else:
+                print(f"假安全区 [{x1},{y1},{w},{h}] 无紫色，已剔除")
+        else:
+            # 球类框直接保留
+            new_boxes.append(box)
+            new_ids.append(id_)
+            new_scores.append(score)
+
+    return new_boxes, new_ids, new_scores, valid_safes
+
+A = 0  # 找球模式
+stage_r = 1
+
+# 后台线程：持续监听串口，更新全局状态
+def uart_listen(uart):
+    global A, stage_r
+    while True:
+        cmd_code = receive(uart)  # 阻塞等待指令，不占用主线程
+        if cmd_code == 0:
+            A = 0
+            print("收到指令[A]：回到找球模式")
+        elif cmd_code == 1:
+            A = 1
+            print("收到指令[CB]：检查小球颜色模式")
+        elif cmd_code == 2:
+            A = 2
+            print("收到指令[FS]：寻找安全区模式")
+        elif cmd_code == 3:
+            stage_r = 2
+            print("收到指令[FB]：进入第二轮")
+
+def run(our):
+    global A, stage_r
+    # 启动后台串口监听线程
+    _thread.start_new_thread(uart_listen, (uart,))
+
+    while True:
+        with ScopedTiming("total", 2):
+            img = pl.get_frame()
+            res = yolo.run(img)
+
+            # res[0]：检测框列表，res[1]：框的类别ID列表
+            boxes = res[0]
+            ids = res[1]
+            scores = res[2]
+            ls_balls = []
+            ls_safe = []
+
+            # 第一轮，夹取球our
+            if stage_r == 1:
+                catch = [our]
+            # 第一轮，夹取球our、2Yellow、3Black
+            elif stage_r == 2:
+                catch = [our, 2, 3]
+
+            for box, id in zip(boxes, ids):
+                box = box.tolist()
+                x1, y1, w, h = box
+                if id in catch:
+                    ls_balls.append([x1, y1, w, h, id])
+                # 记录安全区oursafe
+                if (our == 0 and id == 4) or (our == 1 and id == 5):
+                    ls_safe.append([x1, y1, w, h, id])
+            print(f"小球列表{ls_balls}")
+            print(f"安全区列表{ls_safe}")
+
+            # 找球模式
+            if A == 0:
+                # 将最大的小球发送出去
+                max_ls = find_max(ls_balls)
+                if max_ls is not None:
+                    id = max_ls[4]
+                    send_ls = cal(max_ls[0], max_ls[1], max_ls[2], max_ls[3])
+                    yaw = send_ls[0]
+                    length = send_ls[1]
+                    send(uart, yaw, length, id)
+            # 已经抓到小球，检查小球颜色
+            elif A == 1:
+                num = len(ls_balls)
+                # 小球数量不是1个，或者抓取的小球不在目标内，发送N，松开夹爪
+                if num != 1 or ls_balls[0][-1] not in catch:
+                    time.sleep(0.5)
+                    uart.write("[N]")
+                    print("小球颜色错误")
+                else:
+                    time.sleep(0.5)
+                    uart.write("[Y]")
+                    print("小球颜色正确")
+            elif A == 2:
+                # 剔除无紫色的假安全区，更新 res
+                boxes, ids, scores, ls_safe_filtered = filter_no_purple(
+                    pl.osd_img, boxes, ids, scores, our
+                )
+                res = [boxes, ids, scores]  # 更新 res，draw_result 不再画无效框
+                print(f"新的识别结果{res}")
+
+                # 将安全区发送出去
+                max_ls = find_max(ls_safe_filtered)
+                if max_ls is not None:
+                    id = max_ls[4]
+                    yaw, length = cal(max_ls[0], max_ls[1], max_ls[2], max_ls[3])
+                    send(uart, yaw, length, id)
+                    print(f"安全区通过紫色检测")
+                else:
+                    send(uart, 99, 99, -1)
+                    print("无安全区")
+
+            yolo.draw_result(res, pl.osd_img)
+            pl.show_image()
+            gc.collect()
+    return True
+
+# 添加显示模式，默认hdmi，可选hdmi/lcd/lt9611/st7701/hx8399/nt35516,其中hdmi默认置为lt9611，分辨率1920*1080；lcd默认置为st7701，分辨率800*480
+display_mode = "lcd"
+rgb888p_size = [800, 480]
+
+if __name__ == "__main__":
+    print("----------开始运行----------")
+    uart = init_hardware()
+    pl = PipeLine(rgb888p_size=rgb888p_size, display_mode=display_mode)
+    pl.create()
+    display_size = pl.get_display_size()
+    yolo = init_yolo()
+    yolo.config_preprocess()
+
+    # 第一步，默认我方是0Red，收到R我方就是0Red，收到B我方就是1Blue
+    our = 0
+    for i in range(30):
+        print(i)
+        try:
+            data = uart.read()
+            if data == b"[R]":
+                our = 0
+                break
+            elif data == b"[B]":
+                our = 1
+                break
+        except Exception as e:
+            print("启动异常:", e)
+        time.sleep(0.1)
+
+    run(our)
+
+    yolo.deinit()
+    pl.destroy()
